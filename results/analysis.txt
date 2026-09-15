@@ -13,7 +13,7 @@ teams     A        20    19    95.0%
 teams     B        20    20   100.0%
 teams     C        20    19    95.0%
 ========================================================================================================
-agent-arena 实验分析   |   C:\Users\LEGION\WorkBuddy\2026-09-07-19-50-40\agent-arena\results\runs.db
+agent-arena 实验分析   |   .\agent-arena\results\runs.db
 共 180 条运行记录，其中 180 条已判定
 
 【1】按策略总览

@@ -216,7 +216,7 @@ def run(task, task_id="", tracer=None, max_turns=DEFAULT_MAX_TURNS,
     tools = dict(TOOLS)
     tools["spawn"] = make_spawn(ledger, model=model,
                                 max_sub_turns=max_sub_turns,
-                                timeout_s=int(timeout_s * 0.6))
+                                timeout_s=int(timeout_s * 0.6)) # 创造spawn工具
     schemas = list(TOOL_SCHEMAS) + [SPAWN_SCHEMA]
 
     r = run_agent(
@@ -245,3 +245,24 @@ if __name__ == "__main__":
     print(r)
     print("spawn 次数:", getattr(r, "n_spawns", 0))
     print(r.answer)
+'''
+subagent.py
+    ↓
+主 Agent 调 run_agent()
+    ↓
+主 Agent 调 spawn()
+    ↓
+spawn 又调用 run_agent()
+    ↓
+子 Agent 调 llm.py / validate.py / tools.py
+    ↓
+子 Agent submit
+    ↓
+返回 AgentResult
+    ↓
+Ledger 记成本
+    ↓
+只把 r.answer 作为 spawn 的 ToolOutput
+    ↓
+主 Agent 继续
+'''

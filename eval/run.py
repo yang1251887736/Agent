@@ -1,3 +1,4 @@
+# 把实验跑起来、把 Agent 和 judge 接起来、统计结果、输出对比
 """批量评测运行器。
 
 一次跑：策略 × 任务，结果全部落 SQLite，最后出对比表。
@@ -50,7 +51,7 @@ TASKS = os.path.join(HERE, "tasks.jsonl")
 DB = os.path.join(ROOT, "results", "runs.db")
 RESULTS_DIR = os.path.join(ROOT, "results")
 
-
+# 从 tasks.jsonl 里面把题目读取出来
 def load_tasks(path=TASKS, task_type=None, limit=None, only_ids=None):
     tasks = []
     with open(path, encoding="utf-8") as f:
@@ -68,7 +69,7 @@ def load_tasks(path=TASKS, task_type=None, limit=None, only_ids=None):
         tasks = tasks[:limit]
     return tasks
 
-
+# A/B/C分别运行，这是过滤条件
 def task_type_of(task_id, tasks_by_id):
     return tasks_by_id.get(task_id, {}).get("type", "?")
 
@@ -163,7 +164,7 @@ def main():
                 n_done += 1
                 continue
 
-            j = judge(r.answer, task)
+            j = judge(r.answer, task) #执行judge.py
             row = _row(strategy, task, r, "", j)
             rows.append(row)
 
@@ -366,3 +367,21 @@ def _print_tables(rows, tasks_by_id):
 
 if __name__ == "__main__":
     sys.exit(main())
+
+'''
+① 读取任务
+       ↓
+② 选择策略
+       ↓
+③ Agent 执行
+       ↓
+④ 得到最终答案
+       ↓
+⑤ judge 判对错
+       ↓
+⑥ _row 整理成一条记录
+       ↓
+⑦ SQLite / CSV 保存
+       ↓
+⑧ _agg / _print_tables 统计比较
+'''

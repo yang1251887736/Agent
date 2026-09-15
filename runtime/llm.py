@@ -1,3 +1,4 @@
+# 负责和 LLM 真正通信，并把 LLM 的回复整理成 Agent 能看懂的统一格式
 """LLM 调用封装 —— 只走 OpenAI 兼容协议，不依赖任何 Agent 框架。
 
 call_llm 的返回值结构见下方字段说明，核心循环只依赖这几个字段。
@@ -19,7 +20,7 @@ from openai import OpenAI
 
 _client = None
 
-
+# 获取一个 API 客户端
 def _get_client():
     global _client
     if _client is None:
@@ -49,12 +50,13 @@ def call_llm(messages, tools=None, model=None, temperature=0.0, timeout=120, ret
     }
     if tools:
         kwargs["tools"] = tools
-        kwargs["tool_choice"] = "auto"
+        kwargs["tool_choice"] = "auto" # 让模型自己决定要不要调用工具
 
     last_err = None
-    for attempt in range(retries):
+    for attempt in range(retries): # 如果调用api失败，最多再重试3次
         try:
-            resp = _get_client().chat.completions.create(**kwargs)
+            resp = _get_client().chat.completions.create(**kwargs) # 发送 API 请求
+            # **kwargs 就是把字典拆成函数的关键字参数
             break
         except Exception as e:  # 网络抖动 / 限流，退避重试
             last_err = e
@@ -64,11 +66,11 @@ def call_llm(messages, tools=None, model=None, temperature=0.0, timeout=120, ret
     else:
         raise last_err
 
-    msg = resp.choices[0].message
+    msg = resp.choices[0].message # 模型真正的回复
 
     tool_calls = []
     for tc in msg.tool_calls or []:
-        raw = tc.function.arguments or "{}"
+        raw = tc.function.arguments or "{}" # 取模型生成的工具参数
         try:
             args = json.loads(raw)
             if not isinstance(args, dict):
@@ -76,7 +78,6 @@ def call_llm(messages, tools=None, model=None, temperature=0.0, timeout=120, ret
         except json.JSONDecodeError as e:
             args = {"__parse_error__": f"arguments 不是合法 JSON: {e}; 原文: {raw[:200]}"}
         tool_calls.append({"id": tc.id, "name": tc.function.name, "args": args})
-
     usage = {}
     if getattr(resp, "usage", None):
         usage = {
@@ -92,6 +93,25 @@ def call_llm(messages, tools=None, model=None, temperature=0.0, timeout=120, ret
         "stop_reason": resp.choices[0].finish_reason,
     }
 
+'''
+                llm.py
+                    │
+             JSON解析失败
+                    ↓
+      {"__parse_error__": "..."}
+                    │
+                    ↓
+                validate.py
+                    │
+                    ↓
+          False + 错误描述
+                    │
+                    ↓
+                  Agent
+                    │
+                    ↓
+                  LLM
+'''
 
 if __name__ == "__main__":
     # 冒烟测试：确认 key 通了、能拿到 usage

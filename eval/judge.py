@@ -217,3 +217,33 @@ if __name__ == "__main__":
     # 没配断言必须报错而不是静默通过
     r = judge("anything", {"id": "X", "checks": {}})
     print("\n未配置断言时判定为:", r["pass"], "|", r["failed"][0])
+'''
+                    Agent 最终答案
+                       │
+                       ▼
+                  normalize()
+                       │
+                       ▼
+              ┌─────────────────┐
+              │     judge()     │
+              └─────────────────┘
+                       │
+         ┌─────────────┼─────────────┐
+         ▼             ▼             ▼
+   must_contain   must_contain_any   must_not_contain
+         │             │             │
+         └─────────────┼─────────────┘
+                       │
+                       ▼
+                    regex
+                       │
+                       ▼
+                 failed 列表
+                       │
+                ┌──────┴──────┐
+                │             │
+          failed == []   failed != []
+                │             │
+                ▼             ▼
+              PASS           FAIL
+'''

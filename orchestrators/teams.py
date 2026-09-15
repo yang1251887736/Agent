@@ -1,3 +1,4 @@
+# Planner → 并行 Workers → Lead” 的多 Agent 编排器
 """策略三：Agent Teams —— 一次性拆分，并行推进，最后汇总。
 
 ## 和 subagent 的区别（这两个容易被混为一谈）
@@ -214,7 +215,7 @@ def run(task, task_id="", tracer=None, max_turns=DEFAULT_MAX_TURNS,
     subtasks, plan_raw, plan_usage = _plan(task, model=model,
                                            max_subtasks=n_workers)
     ledger.plan_raw = plan_raw
-    ledger.n_workers = len(subtasks)
+    ledger.n_workers = len(subtasks)  # 分成多少个worker并行
     ledger.plan_prompt_tokens = plan_usage.get("prompt_tokens", 0)
     ledger.plan_completion_tokens = plan_usage.get("completion_tokens", 0)
 
@@ -224,21 +225,21 @@ def run(task, task_id="", tracer=None, max_turns=DEFAULT_MAX_TURNS,
     with ThreadPoolExecutor(max_workers=len(subtasks)) as pool:
         futs = {
             pool.submit(_run_worker, i + 1, sub, src_root, isolate, model,
-                        worker_max_turns, worker_timeout): i
+                        worker_max_turns, worker_timeout): i # 把这个任务扔进线程池，让它去执行
             for i, sub in enumerate(subtasks)
         }
         for fut in futs:
-            i = futs[fut]
+            i = futs[fut] 
             try:
-                r = fut.result()
+                r = fut.result() # 得到每个worker的运行结果
             except Exception as e:          # 单个 worker 炸了不能拖垮整队
-                r = AgentResult(success=False,
+                r = AgentResult(success=False, # 单 Worker 故障隔离
                                 error=f"worker 异常：{type(e).__name__}: {e}")
             results[i] = r
             ledger.absorb(r)
 
     # ---- ③ 汇总
-    findings = []
+    findings = []  # Worker 提供证据，Lead 负责最终判断
     for i, (sub, r) in enumerate(zip(subtasks, results), 1):
         status = "成功" if r.success else f"未完成（{r.error}）"
         findings.append(f"--- 分析员 #{i} [{status}]\n任务：{sub}\n结论：{r.answer or '（无）'}")
@@ -252,6 +253,7 @@ def run(task, task_id="", tracer=None, max_turns=DEFAULT_MAX_TURNS,
         tools=TOOLS, tool_schemas=TOOL_SCHEMAS, model=model,
     )
 
+    # 可以得到：这个 Teams 任务到底拆成了几个 Worker、拆成了什么。
     # 总账：规划 + 所有 worker + 汇总
     r.n_turns += ledger.n_turns
     r.n_tool_calls += ledger.n_tool_calls

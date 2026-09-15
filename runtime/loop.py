@@ -44,7 +44,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from runtime.llm import call_llm                      # noqa: E402
+from runtime.llm import call_llm                      # 把 messages + tools 发给大模型，让大模型决定下一步干什么。
 from runtime.tools import TOOLS, TOOL_SCHEMAS, ToolError  # noqa: E402
 from runtime.validate import validate_tool_arguments   # noqa: E402
 
@@ -56,7 +56,7 @@ SYSTEM_PROMPT = """你是一个代码库分析助手，工作目录是一个 Pyt
 3. 答案要具体：给出文件路径、函数名、行号。不要描述你的搜索过程。
 
 如果工具返回错误，读清楚错误原因，换一个参数或换一个工具重试。"""
-
+# 提醒LLM回答了就提交
 NUDGE = "你还没有提交答案。请调用 submit 工具提交最终答案，不要只回复文字。"
 
 # ---------------------------------------------------------------- 为什么是 20
@@ -66,47 +66,47 @@ NUDGE = "你还没有提交答案。请调用 submit 工具提交最终答案，
 # 同时保证「跑偏了的任务」不会无限空转烧钱。
 # 改这个值之前，先看 results/runs.db 里的 n_turns 分布：
 #   SELECT strategy, MAX(n_turns), AVG(n_turns) FROM runs GROUP BY strategy
-DEFAULT_MAX_TURNS = 20
+DEFAULT_MAX_TURNS = 20  # 最多让 Agent 和 LLM 交互 20 轮
 
 # 连着提醒几次还不提交，就判失败
 MAX_NUDGES = 3
 
-
+# 保存一次 Agent 运行的最终结果
 class AgentResult:
     """一次运行的最终结果。所有编排策略都返回这个，方便统一统计。"""
 
     def __init__(self, success, answer="", n_turns=0, n_tool_calls=0,
                  n_bad_calls=0, prompt_tokens=0, completion_tokens=0,
                  peak_context_chars=0, wall_ms=0, error=""):
-        self.success = success
-        self.answer = answer
-        self.n_turns = n_turns
-        self.n_tool_calls = n_tool_calls
-        self.n_bad_calls = n_bad_calls
-        self.prompt_tokens = prompt_tokens
-        self.completion_tokens = completion_tokens
-        self.peak_context_chars = peak_context_chars
-        self.wall_ms = wall_ms
-        self.error = error
+        self.success = success # 任务成功了吗
+        self.answer = answer # 最终答案
+        self.n_turns = n_turns # 运行了几轮
+        self.n_tool_calls = n_tool_calls # 调用了多少次工具
+        self.n_bad_calls = n_bad_calls # 模型调用了不存在的工具的次数
+        self.prompt_tokens = prompt_tokens # prompt用了多少 token
+        self.completion_tokens = completion_tokens # 总共用了多少token
+        self.peak_context_chars = peak_context_chars # 上下文最多有多少字符
+        self.wall_ms = wall_ms # 运行了多久
+        self.error = error # 如果失败，显示原因
 
-    def as_dict(self):
+    def as_dict(self): # 变dict格式
         return vars(self).copy()
 
-    def __repr__(self):
+    def __repr__(self): # print格式
         flag = "OK  " if self.success else "FAIL"
         return (f"<{flag} turns={self.n_turns} calls={self.n_tool_calls} "
                 f"bad={self.n_bad_calls} tok={self.prompt_tokens + self.completion_tokens} "
                 f"err={self.error!r}>")
 
-
+# 根据工具名字，找到这个工具对应的参数 schema
 def _schema_of(tool_name, tool_schemas):
     """从 tool_schemas 里取出某个工具的 parameters（给 validate 用）。"""
     for s in tool_schemas:
         if s["function"]["name"] == tool_name:
-            return s["function"].get("parameters", {})
+            return s["function"].get("parameters", {}) # 返回参数要求，检查模型给的参数对不对
     return None
 
-
+# 计算当前 messages（主agent） 有多少字符
 def _ctx_chars(messages):
     """上下文大小的代理指标。
 
@@ -150,9 +150,10 @@ def run_agent(task, task_id="", strategy="single", max_turns=DEFAULT_MAX_TURNS,
     tools = tools if tools is not None else TOOLS
     tool_schemas = tool_schemas if tool_schemas is not None else TOOL_SCHEMAS
 
-    t_start = time.time()
+    t_start = time.time() # 记录：Agent 从什么时候开始运行
     run_id = tracer.start_run(strategy, task_id) if tracer else None
 
+    # 初始化
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": task},
@@ -167,6 +168,7 @@ def run_agent(task, task_id="", strategy="single", max_turns=DEFAULT_MAX_TURNS,
     nudges = 0
     final_answer = ""
 
+    # 如果超时了，统一生成一个失败结果
     def _timeout_result():
         return AgentResult(
             success=False, answer=final_answer, n_turns=n_turns,
@@ -178,7 +180,7 @@ def run_agent(task, task_id="", strategy="single", max_turns=DEFAULT_MAX_TURNS,
         )
 
     # ---------------------------------------------------------------- 外层循环
-    while n_turns < max_turns:
+    while n_turns < max_turns: # 只要还没有超过最大轮数，就继续运行 Agent
 
         # 超时检查放在每轮开头，保证「刚超时」能被及时拦下，
         #         而不是等这一轮工具跑完（edit_file / run_tests 可能跑几十秒）。
@@ -188,11 +190,12 @@ def run_agent(task, task_id="", strategy="single", max_turns=DEFAULT_MAX_TURNS,
         n_turns += 1
         t_turn = time.time()
 
-        # 调一次 LLM。
+        # 把目前所有聊天历史 + 工具菜单交给 LLM，让 LLM 决定下一步。
         #         注意：这里没有 try/except，是刻意的 —— call_llm 内部已经退避重试
         #         3 次了，还失败说明是网络/鉴权级别的硬故障，
         #         与其吞掉异常让实验静默变脏，不如让它冒出来，你立刻能看见。
         reply = call_llm(messages, tools=tool_schemas, model=model)
+        # 读取输入输出token使用量
         usage = reply.get("usage") or {}
         prompt_tokens += usage.get("prompt_tokens", 0)
         completion_tokens += usage.get("completion_tokens", 0)
@@ -200,7 +203,9 @@ def run_agent(task, task_id="", strategy="single", max_turns=DEFAULT_MAX_TURNS,
         # 把 assistant 消息 append 回 messages。
         #         llm.py 把 tool_calls 简化成了 {id, name, args}，
         #         但 append 回去必须还原成 OpenAI 原始格式，否则下一轮 API 直接拒绝。
+        # 把 LLM 的回复重新加入 messages
         assistant_msg = {"role": "assistant", "content": reply["content"] or ""}
+        # 如果LLM说要调用工具，就转换标准格式
         if reply["tool_calls"]:
             assistant_msg["tool_calls"] = [
                 {
@@ -213,7 +218,9 @@ def run_agent(task, task_id="", strategy="single", max_turns=DEFAULT_MAX_TURNS,
                 }
                 for tc in reply["tool_calls"]
             ]
+        # 更新message
         messages.append(assistant_msg)
+        # 更新最大上下文
         peak_context = max(peak_context, _ctx_chars(messages))
 
         # 模型没喊人（只说话）不算完成。
@@ -228,6 +235,7 @@ def run_agent(task, task_id="", strategy="single", max_turns=DEFAULT_MAX_TURNS,
                     wall_ms=int((time.time() - t_start) * 1000),
                     error=f"模型连续 {nudges} 轮未调用 submit",
                 ), tracer, run_id)
+            # 提示LLM进行调用工具提交
             messages.append({"role": "user", "content": NUDGE})
             if tracer and run_id:
                 tracer.log_turn(run_id, turn=n_turns, tool_name=None,
@@ -249,6 +257,7 @@ def run_agent(task, task_id="", strategy="single", max_turns=DEFAULT_MAX_TURNS,
             is_error = False
 
             # 6a. 工具不存在（模型幻觉出工具名）
+            # 工具不存在 / 参数错误 / 执行异常，都变成 role=tool 消息，再喂回模型
             if name not in tools:
                 n_bad_calls += 1
                 is_error = True
@@ -259,6 +268,7 @@ def run_agent(task, task_id="", strategy="single", max_turns=DEFAULT_MAX_TURNS,
 
             else:
                 # 6b. 参数校验（抄 pi 的第①样）
+                # 检查：LLM 给的参数是不是符合要求，不符合要求变成 role=tool 消息，再喂回模型
                 schema = _schema_of(name, tool_schemas) or {}
                 ok, err = validate_tool_arguments(schema, args)
                 if not ok:
@@ -267,7 +277,7 @@ def run_agent(task, task_id="", strategy="single", max_turns=DEFAULT_MAX_TURNS,
                     result_text = f"参数错误：{err}"
 
                 else:
-                    # 6c. 执行（抄 pi 的第②样：所有异常都变成文本，绝不冒出去）
+                    # 6c. 执行（抄 pi 的第②样：所有异常都变成文本，绝不冒出去）--except中的result_text
                     try:
                         out = tools[name](**args)
                     except ToolError as e:
@@ -289,7 +299,8 @@ def run_agent(task, task_id="", strategy="single", max_turns=DEFAULT_MAX_TURNS,
                             n_bad_calls += 1
                             is_error = True
 
-                        # 6d. terminate（抄 pi 的第③样）—— submit 返回的
+                        # 6d. terminate（抄 pi 的第③样）—— submit 返回的:让terminate变成True
+                        # 这个工具告诉 Agent：任务可以结束了
                         if out.terminate:
                             final_answer = args.get("answer", "") or ""
                             messages.append({
@@ -382,3 +393,44 @@ if __name__ == "__main__":
     print("-" * 68)
     print("答案:", r.answer)
     print("=" * 68)
+
+'''
+                用户任务
+                     │
+                     ↓
+              创建 messages
+                     │
+                     ↓
+              ┌─────────────┐
+              │   调用 LLM   │
+              └──────┬──────┘
+                     │
+             LLM 要不要调用工具？
+                /           \
+              否             是
+              │              │
+              ↓              ↓
+           nudge        遍历 tool_calls
+              │              │
+              │       ┌──────┴──────┐
+              │       ↓             ↓
+              │    工具不存在？   工具存在
+              │       │             │
+              │       ↓             ↓
+              │     错误         参数校验
+              │                     │
+              │                     ↓
+              │                  执行工具
+              │                     │
+              │              ┌──────┴──────┐
+              │              ↓             ↓
+              │          普通结果      terminate=True
+              │              │             │
+              │              ↓             ↓
+              │        role=tool        最终答案
+              │              │             │
+              └──────→ messages ←─────────┘
+                             │
+                             ↓
+                       下一轮 LLM
+'''

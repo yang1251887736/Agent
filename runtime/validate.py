@@ -1,3 +1,4 @@
+# 检查 LLM 生成的工具参数对不对；如果不对，不让 Agent 崩，而是把错误信息返回给 LLM，让 LLM 下一轮自己改
 """工具参数校验。参考 pi-mono 的 `agent-loop.ts:535` validateToolArguments 实现
 （只支持 JSON Schema 子集，不引 jsonschema 依赖）。
 
@@ -24,6 +25,7 @@
 够用，且不需要引入 jsonschema 依赖。
 """
 
+# 把Json换成Python类型
 _TYPES = {
     "string": str,
     "integer": int,
@@ -33,7 +35,7 @@ _TYPES = {
     "object": dict,
 }
 
-
+# 对比LLM给的参数和工具说明书里要求的参数
 def validate_tool_arguments(schema, args):
     """校验模型给的参数。
 
@@ -46,16 +48,25 @@ def validate_tool_arguments(schema, args):
         ok=True 时 error 为 None
     """
     # 模型连 JSON 都没吐对 —— llm.py 里打了这个标记
+    # 这甚至还没到“参数是否正确”的阶段，JSON 本身就坏了
     if "__parse_error__" in args:
         return False, args["__parse_error__"]
 
+    # args 必须是 dict
+    '''示例
+    {
+    "path": "main.py"
+    }
+    '''
     if not isinstance(args, dict):
         return False, f"参数必须是对象，收到的是 {type(args).__name__}"
 
+    # 从schema中的参数，和必须有的参数
     properties = schema.get("properties", {}) or {}
     required = schema.get("required", []) or []
 
     # 1. 缺必填字段
+    # llm给的参数没有达到required的要求
     missing = [k for k in required if k not in args]
     if missing:
         return False, (
@@ -64,6 +75,7 @@ def validate_tool_arguments(schema, args):
         )
 
     # 2. 幻觉出不存在参数名 —— 这一条最常见，也最值得报给模型
+    # llm给了一个properties中没有的参数
     unknown = [k for k in args if k not in properties]
     if unknown:
         return False, (
@@ -97,7 +109,21 @@ def validate_tool_arguments(schema, args):
             return False, f"参数 {key} 的取值必须是 {enum} 之一，收到 {value!r}"
 
     return True, None
-
+    '''
+    JSON 没问题
+    ↓
+    args 是 dict
+    ↓
+    必填参数都有
+    ↓
+    没有不存在的参数
+    ↓
+    类型正确
+    ↓
+    enum 正确
+    ↓
+    OK
+    '''
 
 if __name__ == "__main__":
     schema = {

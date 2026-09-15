@@ -1,3 +1,5 @@
+'''定义工具+TOOL(工具本体)+Tool Sechema（工具说明书）：给LLM看的'''
+
 """六个工具 + 它们的菜单。
 
 工具定义与实现放在同一个文件，改函数签名时菜单跟着改。模型只看得见 name/description/parameters，
@@ -45,7 +47,7 @@ import threading
 # ---------------------------------------------------------------- 返回值契约
 
 
-class ToolOutput:
+class ToolOutput: # 规定所有工具最后都返回一种统一格式
     """工具执行结果。
 
     text      喂回模型的文本
@@ -62,27 +64,32 @@ class ToolOutput:
         return self.text
 
 
-class ToolError(Exception):
+class ToolError(Exception):  # loop.py 第283行
     """工具执行失败。由调用方转成一条 tool 消息喂回模型，不让程序崩掉。"""
 
 
 # ---------------------------------------------------------------- 沙箱根目录
 
 # 所有文件操作都被限制在这个目录内。模型可能会传 ../../etc/passwd，必须挡掉。
-# 环境变量 ARENA_REPO 指向 requests 的一份**副本**（见 D1 任务单）。
+# 环境变量 ARENA_REPO 指向 requests 的一份**副本**。
+'''
+“给每个 Agent 划定自己的文件操作范围，并防止它越界。
+'''
+# Agent 的“活动范围”
 DEFAULT_REPO_ROOT = os.path.abspath(os.environ.get("ARENA_REPO", os.path.join(
     os.path.dirname(__file__), "..", "sandbox", "requests_src")))
 
 # 线程局部：每个线程可以有自己的仓库根目录（teams 的 worker 各用一份独立副本）。
 # 主线程 set 一次后，新线程不会自动继承 —— 这是刻意的，
+
 # 每个 worker 必须显式声明自己操作哪个副本，避免「忘了设就继承了别人的」。
 _local = threading.local()
 
-
+# 获取当前线程正在使用的仓库
 def current_repo_root():
     return getattr(_local, "root", DEFAULT_REPO_ROOT)
 
-
+# 设置当前线程的仓库
 def set_repo_root(path):
     """设置**当前线程**的仓库根目录。"""
     _local.root = os.path.abspath(path)
@@ -93,11 +100,12 @@ def reset_repo_root():
     """把当前线程恢复成默认根目录。"""
     _local.root = DEFAULT_REPO_ROOT
 
-
+# current_repo_root的简写
 def _root():
     return current_repo_root()
 
 
+# 检查路径有没有越界
 def _safe(path):
     """把相对路径解析到当前线程的 REPO_ROOT 内，越界直接拒绝。"""
     root = current_repo_root()
@@ -109,10 +117,11 @@ def _safe(path):
 
 # ---------------------------------------------------------------- 工具实现
 
-
 def tool_find_files(pattern):
     """按文件名找文件。"""
+    # _root()-仓库根目录, **-所有子目录, pattern-文件匹配规则
     matches = sorted(glob.glob(os.path.join(_root(), "**", pattern), recursive=True))
+    # 把绝对目录变成相对目录
     rel = [os.path.relpath(m, _root()) for m in matches]
     rel = [r for r in rel if not r.startswith("..")]
     if not rel:
@@ -125,6 +134,7 @@ def tool_find_files(pattern):
 def tool_grep(pattern, path="", max_results=30):
     """按正则搜索文件内容，返回 文件:行号:内容。"""
     try:
+        # 把字符串变成正则表达式
         regex = re.compile(pattern)
     except re.error as e:
         raise ToolError(f"正则表达式不合法: {e}")
@@ -133,13 +143,16 @@ def tool_grep(pattern, path="", max_results=30):
     if os.path.isfile(root):
         files = [root]
     else:
+        # 找所有的py文件
         files = sorted(glob.glob(os.path.join(root, "**", "*.py"), recursive=True))
 
     hits = []
+    # 一个个文件看
     for fp in files:
         try:
             with open(fp, encoding="utf-8", errors="replace") as f:
                 for i, line in enumerate(f, 1):
+                    # 当前这一行有没有匹配到目标，找到保存下来
                     if regex.search(line):
                         hits.append(f"{os.path.relpath(fp, _root())}:{i}:{line.rstrip()}")
                         if len(hits) >= max_results:
@@ -157,6 +170,7 @@ def tool_grep(pattern, path="", max_results=30):
 
 def tool_read_file(path, offset=0, limit=200):
     """读文件内容，带行号。offset=0 且 limit=0 表示读整个文件。"""
+    # offset从第几行开始，limit读几行
     fp = _safe(path)
     if not os.path.isfile(fp):
         raise ToolError(f"文件不存在: {path}（先用 find_files 确认路径）")
@@ -168,7 +182,7 @@ def tool_read_file(path, offset=0, limit=200):
         chunk = lines[offset: offset + limit]
     else:
         chunk = lines[offset:]
-
+    # 给每一行加行号
     out = [f"{offset + i + 1:5d} | {l.rstrip()}" for i, l in enumerate(chunk)]
     head = f"[共 {len(lines)} 行，显示第 {offset + 1}-{offset + len(chunk)} 行]\n"
     return ToolOutput(head + "\n".join(out))
@@ -196,6 +210,7 @@ def tool_edit_file(path, old, new):
             f"请把 old 写得更长一些（多包含几行上下文），确保唯一。"
         )
 
+    # 只替换1次
     with open(fp, "w", encoding="utf-8") as f:
         f.write(src.replace(old, new, 1))
     return ToolOutput(f"已替换成功: {path}")
@@ -231,7 +246,7 @@ def tool_submit(answer):
 
 
 # ---------------------------------------------------------------- 菜单 + 注册表
-
+# TOOLS：把名字和真正函数对应起来
 TOOLS = {
     "find_files": tool_find_files,
     "grep": tool_grep,
@@ -240,7 +255,7 @@ TOOLS = {
     "run_tests": tool_run_tests,
     "submit": tool_submit,
 }
-
+# 给LLM看的工具菜单
 TOOL_SCHEMAS = [
     {
         "type": "function",
@@ -389,3 +404,56 @@ if __name__ == "__main__":
     print(tool_read_file("requests/exceptions.py", 0, 4))
     print("\n--- 越界访问测试 ---")
     print(tool_read_file("../../../../etc/passwd", 0, 2))
+'''
+第一层：安全
+_safe()
+REPO_ROOT
+threading.local()
+
+        ↓
+
+第二层：工具实现
+find_files
+grep
+read_file
+edit_file
+run_tests
+submit
+
+        ↓
+
+第三层：统一返回
+ToolOutput
+ToolError
+
+        ↓
+
+第四层：工具注册
+TOOLS
+TOOL_SCHEMAS
+
+        ↓
+
+第五层：给 Agent/LLM 使用
+LLM 选择工具
+        ↓
+Python 执行工具
+        ↓
+结果返回 LLM
+        ↓
+继续 or submit
+'''
+
+'''
+TOOL_SCHEMAS
+    ↓
+告诉 LLM：“我有什么工具、怎么调用”
+
+TOOLS
+    ↓
+告诉 Python：“工具名字对应哪个函数”
+
+ToolOutput
+    ↓
+告诉 Agent：“工具执行结果是什么、是否报错、是否结束”
+'''

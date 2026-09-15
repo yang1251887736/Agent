@@ -1,8 +1,9 @@
+# Agent 每做一轮，就把“做了什么、结果怎样、花了多少 token、用了多久”记进 SQLite，最后再从数据库里统计实验结果。
 """执行追踪 —— 每一轮的工具、参数、结果、token、耗时、上下文长度全落 SQLite。
 
 执行追踪把每一轮的工具、参数、结果、token、耗时、上下文长度落进 SQLite，解决两个问题：
 
-1. **实验数据源** —— 你最后那张对比表的所有数字都从这里出，
+1. **实验数据源** —— 最后那张对比表的所有数字都从这里出，
    不落库的话 180 次运行（3 编排 × 60 任务）的结果只能靠 print 抓，迟早丢。
 2. 提供一张真实被查询、被聚合的表，正好能当作 SQL 能力的项目佐证。
 
@@ -26,9 +27,11 @@ import sqlite3
 import time
 import uuid
 
+# 定义数据库
+# 创建两个表runs&turns
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
-    run_id        TEXT PRIMARY KEY,
+    run_id        TEXT PRIMARY KEY, 
     strategy      TEXT NOT NULL,
     task_id       TEXT NOT NULL,
     started_at    TEXT,
@@ -70,13 +73,13 @@ class Tracer:
         d = os.path.dirname(db_path)
         if d:
             os.makedirs(d, exist_ok=True)
-        self.db_path = db_path
-        self._t0 = {}
+        self.db_path = db_path # 把数据库路径保存到对象里面
+        self._t0 = {} # 记录每次 run 的开始时间
         with self._conn() as c:
             c.executescript(SCHEMA)
 
     @contextlib.contextmanager
-    def _conn(self):
+    def _conn(self): # 数据库连接管理
         """连接用完必须显式 close，否则 Windows 上删不掉 .db 文件。"""
         conn = sqlite3.connect(self.db_path)
         try:
@@ -85,17 +88,17 @@ class Tracer:
         finally:
             conn.close()
 
-    def start_run(self, strategy, task_id):
+    def start_run(self, strategy, task_id): # 开始一次实验
         run_id = f"{strategy}_{task_id}_{uuid.uuid4().hex[:6]}"
         with self._conn() as c:
-            c.execute(
+            c.execute(  # 把 run 写入数据库
                 "INSERT INTO runs (run_id, strategy, task_id, started_at) VALUES (?,?,?,?)",
                 (run_id, strategy, task_id, time.strftime("%Y-%m-%d %H:%M:%S")),
             )
         self._t0[run_id] = time.time()
         return run_id
 
-    def log_turn(
+    def log_turn( # 记录一轮
         self,
         run_id,
         turn,
@@ -129,27 +132,29 @@ class Tracer:
                 ),
             )
 
+    # 结束一次实验
     def finish_run(self, run_id, success, final_answer="", n_bad_calls=0, error=""):
         started = self._t0.pop(run_id, None)
+        # 运行一次agent耗时多久
         wall_ms = int((time.time() - started) * 1000) if started else None
 
         with self._conn() as c:
-            agg = c.execute(
+            agg = c.execute( # 从 turns 聚合统计
                 """SELECT COUNT(*), SUM(is_error),
                           SUM(prompt_tokens), SUM(completion_tokens),
                           MAX(context_chars)
                    FROM turns WHERE run_id=?""",
                 (run_id,),
             ).fetchone()
-            n_tool = c.execute(
+            n_tool = c.execute( # 统计工具调用次数
                 "SELECT COUNT(*) FROM turns WHERE run_id=? AND tool_name IS NOT NULL",
                 (run_id,),
             ).fetchone()[0]
-            n_turns = c.execute(
+            n_turns = c.execute( # 统计轮数
                 "SELECT COUNT(DISTINCT turn) FROM turns WHERE run_id=?", (run_id,)
             ).fetchone()[0]
 
-            c.execute(
+            c.execute( # 更新 runs
                 """UPDATE runs SET
                      finished_at=?, wall_ms=?, n_turns=?, n_tool_calls=?, n_bad_calls=?,
                      prompt_tokens=?, completion_tokens=?, peak_context_chars=?,
@@ -175,7 +180,7 @@ class Tracer:
     # ---------- 出报告用的聚合查询 ----------
 
     def summary_by_strategy(self):
-        """返回每种编排策略的汇总。这就是你 README 里那张表的来源。"""
+        """返回每种编排策略的汇总。这就是 README 里那张表的来源。"""
         sql = """
         SELECT
             strategy,
@@ -196,6 +201,7 @@ class Tracer:
 
     def summary_by_strategy_and_type(self, task_type_of):
         """按「策略 × 任务类型」细分 —— 边界条件结论从这里出。
+        哪种 Agent 编排策略在哪类任务上更有优势
 
         task_type_of: 函数，task_id -> "A" / "B" / "C"
         """

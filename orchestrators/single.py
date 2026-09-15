@@ -27,10 +27,9 @@ from runtime.tools import TOOLS, TOOL_SCHEMAS                          # noqa: E
 
 NAME = "single"
 
-
 def run(task, task_id="", tracer=None, max_turns=DEFAULT_MAX_TURNS,
         timeout_s=300, model=None, **kw):
-    return run_agent(
+    return run_agent( # 我要采用 single 策略，请 run_agent() 按 single 的配置跑起来
         task, task_id=task_id, strategy=NAME, tracer=tracer,
         max_turns=max_turns, timeout_s=timeout_s,
         system_prompt=SYSTEM_PROMPT,
