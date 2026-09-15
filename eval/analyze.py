@@ -8,9 +8,28 @@
     python -m eval.analyze                          # 全部分析
     python -m eval.analyze --db results/runs.db
     python -m eval.analyze --turns                  # 只看轮次分布
+    python -m eval.analyze --csv results/round_full2.csv   # 指定完整口径用的明细 CSV
+
+⚠️ 关于 token 的两个口径（这个项目最容易踩的坑，务必先读）：
+
+  · 主 agent 口径 —— 从 runs.db 去重后算出来。**只含主 agent。**
+  · 完整口径   —— 只能读 run.py 导出的明细 CSV。**含子 agent / worker。**
+
+  为什么库里的值不能直接用：`tracer.log_turn` 是在 loop.py 的
+  `for tc in tool_calls` 循环里调用的 —— 一轮里模型并发发起 N 个工具调用就写 N 行，
+  每行都带**同一次 LLM 回复**的 usage。而 `finish_run` 是用
+  `SUM(prompt_tokens)` 横跨这些行聚合的，于是这一轮的用量被算了 N 次。
+  （`n_turns` 用的是 `COUNT(DISTINCT turn)`，所以轮次是对的，只有 token 虚高。）
+
+  为什么库里还少：子 agent 和 worker 的 tracer 是 None，根本不写 turns 表，
+  它们的开销只累加在内存 AgentResult 里 → 只有 CSV 有。
+
+  两个偏差方向相反，所以**不能用系数修**，只能分别取各自口径。
 """
 
 import argparse
+import csv
+import glob
 import os
 import sqlite3
 import sys
@@ -18,9 +37,25 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 DEFAULT_DB = os.path.join(ROOT, "results", "runs.db")
+DEFAULT_CSV = os.path.join(ROOT, "results", "round_full2.csv")
 
 # 任务 id 首字母就是类型（A01 / B12 / C07）
 TYPE_SQL = "UPPER(SUBSTR(task_id, 1, 1))"
+
+# ⚠️ token 聚合必须先去重，否则虚高 39%~96%（虚高倍数 = 该次运行的 工具调用数/轮数）。
+# 每个 (run_id, turn) 只保留一次 usage，再按 run 求和 —— 这才是主 agent 的真实用量。
+DEDUP_RUN_SQL = """
+    (SELECT run_id,
+            SUM(prompt_tokens)     AS prompt_tokens,
+            SUM(completion_tokens) AS completion_tokens,
+            COUNT(*)               AS n_turns
+       FROM (SELECT run_id, turn,
+                    MAX(prompt_tokens)     AS prompt_tokens,
+                    MAX(completion_tokens) AS completion_tokens
+               FROM turns GROUP BY run_id, turn)
+      GROUP BY run_id)
+"""
+TOK = "COALESCE(d.prompt_tokens, 0) + COALESCE(d.completion_tokens, 0)"
 
 
 def _q(conn, sql, args=()):
@@ -36,23 +71,24 @@ def _bar(pct, width=24):
 
 
 def show_overall(conn):
-    print("\n【1】按策略总览")
+    print("\n【1】按策略总览   （token = 主 agent 口径，已按轮去重）")
     print("=" * 104)
     sql = f"""
-    SELECT strategy,
+    SELECT r.strategy,
            COUNT(*)                                        AS n,
-           ROUND(100.0*SUM(passed)/COUNT(*), 1)             AS pass_pct,
-           ROUND(100.0*SUM(success)/COUNT(*), 1)            AS submit_pct,
-           ROUND(AVG(n_turns), 1)                           AS avg_turns,
-           ROUND(AVG(n_tool_calls), 1)                      AS avg_calls,
-           ROUND(100.0*SUM(n_bad_calls)/MAX(SUM(n_tool_calls),1), 1) AS bad_pct,
-           ROUND(AVG(prompt_tokens+completion_tokens))      AS avg_tokens,
-           ROUND(AVG(peak_context_chars))                   AS avg_ctx,
-           MAX(peak_context_chars)                          AS max_ctx,
-           ROUND(AVG(wall_ms)/1000.0, 1)                    AS avg_sec
-    FROM runs
-    WHERE passed IS NOT NULL
-    GROUP BY strategy
+           ROUND(100.0*SUM(r.passed)/COUNT(*), 1)             AS pass_pct,
+           ROUND(100.0*SUM(r.success)/COUNT(*), 1)            AS submit_pct,
+           ROUND(AVG(d.n_turns), 1)                           AS avg_turns,
+           ROUND(AVG(r.n_tool_calls), 1)                      AS avg_calls,
+           ROUND(100.0*SUM(r.n_bad_calls)/MAX(SUM(r.n_tool_calls),1), 1) AS bad_pct,
+           ROUND(AVG({TOK}))                                  AS avg_tokens,
+           ROUND(AVG(r.peak_context_chars))                   AS avg_ctx,
+           MAX(r.peak_context_chars)                          AS max_ctx,
+           ROUND(AVG(r.wall_ms)/1000.0, 1)                    AS avg_sec
+    FROM runs r
+    LEFT JOIN {DEDUP_RUN_SQL} d ON d.run_id = r.run_id
+    WHERE r.passed IS NOT NULL
+    GROUP BY r.strategy
     ORDER BY avg_tokens
     """
     rows = _q(conn, sql)
@@ -74,23 +110,26 @@ def show_overall(conn):
     print("-" * 104)
     print("  完成率 = 通过断言的比例 | 提交率 = agent 自认为完成的比例")
     print("  两者差距大 = agent 自信地交了错答案（这个 gap 本身就是个指标）")
+    print("  ⚠️ token 一列只含主 agent。子 agent / worker 不落库，")
+    print("     完整口径（含它们）见【9】，那才是能拿去横向比的总账。")
     return rows
 
 
 def show_by_type(conn):
-    print("\n【2】策略 × 任务类型 —— 边界条件结论从这里出")
+    print("\n【2】策略 × 任务类型 —— 边界条件结论从这里出   （token = 主 agent 口径）")
     print("=" * 104)
     sql = f"""
-    SELECT strategy, {TYPE_SQL} AS ttype,
+    SELECT r.strategy, {TYPE_SQL} AS ttype,
            COUNT(*)                                    AS n,
-           ROUND(100.0*SUM(passed)/COUNT(*), 1)         AS pass_pct,
-           ROUND(AVG(prompt_tokens+completion_tokens))  AS avg_tokens,
-           ROUND(AVG(peak_context_chars))               AS avg_ctx,
-           ROUND(AVG(n_turns),1)                        AS avg_turns,
-           ROUND(AVG(wall_ms)/1000.0,1)                 AS avg_sec
-    FROM runs
-    WHERE passed IS NOT NULL
-    GROUP BY strategy, {TYPE_SQL}
+           ROUND(100.0*SUM(r.passed)/COUNT(*), 1)       AS pass_pct,
+           ROUND(AVG({TOK}))                            AS avg_tokens,
+           ROUND(AVG(r.peak_context_chars))             AS avg_ctx,
+           ROUND(AVG(d.n_turns),1)                      AS avg_turns,
+           ROUND(AVG(r.wall_ms)/1000.0,1)               AS avg_sec
+    FROM runs r
+    LEFT JOIN {DEDUP_RUN_SQL} d ON d.run_id = r.run_id
+    WHERE r.passed IS NOT NULL
+    GROUP BY r.strategy, {TYPE_SQL}
     ORDER BY ttype, strategy
     """
     rows = _q(conn, sql)
@@ -142,7 +181,10 @@ def show_errors(conn):
     print("=" * 104)
     print("  注意：这里统计的是**主 agent** 的调用。"
           "subagent 的子 agent、teams 的 worker 不写 turns 表")
-    print("        （它们的开销走 ledger 计入总账，但不进明细），所以这一项不代表全貌。")
+    print("        （它们的开销只累加在内存 AgentResult 里，既不落库也不进明细），"
+          "所以这一项不代表全貌。")
+    print("  另：turns 表一行 = 一次工具调用（不是一轮），所以下面的次数可以直接信；")
+    print("      但同一轮的 prompt/completion 会被这 N 行各记一遍 —— token 才需要去重。")
     sql = """
     SELECT r.strategy AS strategy,
            COALESCE(t.tool_name, '(该轮未调用工具)') AS tool,
@@ -166,15 +208,16 @@ def show_errors(conn):
 
 
 def show_failures(conn, limit=15):
-    print(f"\n【8】未通过的任务（前 {limit} 条）—— 人工核验判定是否合理")
+    print(f"\n【8】未通过的任务（前 {limit} 条）—— 人工核验判定是否合理   （tok = 主 agent）")
     print("=" * 104)
-    sql = """
-    SELECT strategy, task_id, passed, success, n_turns, n_bad_calls,
-           prompt_tokens+completion_tokens AS tokens,
-           COALESCE(failed_check, error, '') AS reason
-    FROM runs
-    WHERE passed = 0
-    ORDER BY strategy, task_id
+    sql = f"""
+    SELECT r.strategy, r.task_id, d.n_turns, r.n_bad_calls,
+           {TOK} AS tokens,
+           COALESCE(r.failed_check, r.error, '') AS reason
+    FROM runs r
+    LEFT JOIN {DEDUP_RUN_SQL} d ON d.run_id = r.run_id
+    WHERE r.passed = 0
+    ORDER BY r.strategy, r.task_id
     LIMIT ?
     """
     rows = _q(conn, sql, (limit,))
@@ -209,16 +252,18 @@ def show_gap(conn):
 
 
 def show_cost(conn):
-    print("\n【7】总成本 —— 如果上生产，这笔账怎么算")
+    print("\n【7】主 agent 成本 —— 已按轮去重，**只含主 agent**")
     print("=" * 104)
-    sql = """
-    SELECT strategy,
-           SUM(prompt_tokens)     AS in_tok,
-           SUM(completion_tokens) AS out_tok,
-           SUM(prompt_tokens+completion_tokens) AS total_tok,
-           ROUND(SUM(wall_ms)/1000.0, 1) AS total_sec,
+    sql = f"""
+    SELECT r.strategy,
+           SUM(d.prompt_tokens)     AS in_tok,
+           SUM(d.completion_tokens) AS out_tok,
+           SUM({TOK})               AS total_tok,
+           ROUND(SUM(r.wall_ms)/1000.0, 1) AS total_sec,
            COUNT(*) AS n
-    FROM runs WHERE passed IS NOT NULL GROUP BY strategy
+    FROM runs r
+    LEFT JOIN {DEDUP_RUN_SQL} d ON d.run_id = r.run_id
+    WHERE r.passed IS NOT NULL GROUP BY r.strategy
     """
     rows = _q(conn, sql)
     for r in rows:
@@ -235,6 +280,75 @@ def show_cost(conn):
                 print(f"  {r['strategy']:<10} 的 token 是 {base['strategy']} 的 "
                       f"{r['total_tok']/max(base['total_tok'],1):.1f} 倍，"
                       f"耗时是 {r['total_sec']/max(base['total_sec'],1):.2f} 倍")
+    print()
+    print("  这一节只有主 agent —— 子 agent / worker 的消费没落库。")
+    print("  想横向比成本，用【9】的完整口径；这一节用来看「决策者自己被喂了多少」。")
+    return rows
+
+
+def _find_csv(path=None):
+    """定位 run.py 导出的明细 CSV（完整口径的唯一来源）。"""
+    if path and os.path.exists(path):
+        return path
+    cands = glob.glob(os.path.join(ROOT, "results", "round*.csv"))
+    return max(cands, key=os.path.getmtime) if cands else None
+
+
+def show_cost_full(conn, csv_path=None):
+    """【9】完整口径 —— 含子 agent / worker，唯一能横向比的总账。
+
+    为什么必须读 CSV：子 agent（orchestrators/subagent.py）和 worker（teams.py）
+    的 tracer 是 None，一行 turns 都不写；它们的用量只是被 Ledger 累加回内存里的
+    AgentResult，最后由 run.py 的 _write_csv 落到 CSV 上。库里根本查不到。
+
+    拆分方法：CSV 的 tokens 列是内存口径（完整）；主 agent 那一份从库里按轮去重取；
+    两者相减，剩下的就是子 agent / worker 的开销。
+    """
+    print("\n【9】完整成本 —— 含子 agent / worker（这才是能横向比的总账）")
+    print("=" * 104)
+    path = _find_csv(csv_path)
+    if not path:
+        print("  没找到明细 CSV。先跑一次： python -m eval.run --tag full2")
+        return []
+
+    agg = {}
+    with open(path, encoding="utf-8-sig") as f:
+        for row in csv.DictReader(f):
+            a = agg.setdefault(row["strategy"], {"n": 0, "tok": 0})
+            a["n"] += 1
+            a["tok"] += int(row["tokens"])
+
+    lead = {r["strategy"]: r["avg_lead"] for r in _q(conn, f"""
+        SELECT r.strategy AS strategy, AVG({TOK}) AS avg_lead
+        FROM runs r
+        LEFT JOIN {DEDUP_RUN_SQL} d ON d.run_id = r.run_id
+        WHERE r.passed IS NOT NULL GROUP BY r.strategy
+    """)}
+
+    rows = []
+    for s in set(agg) | set(lead):
+        a, l = agg.get(s), lead.get(s) or 0
+        if a:                                  # CSV 里有：完整口径直接读
+            n, full = a["n"], a["tok"] / max(a["n"], 1)
+        else:                                  # CSV 里没有（如 single）：无子 agent，完整 = 主 agent
+            n, full = 0, l
+        rows.append({"s": s, "n": n, "full": full, "lead": l, "child": full - l})
+    rows.sort(key=lambda r: r["full"])
+
+    base = next((r["full"] for r in rows if r["s"] == "single"), None) or rows[0]["full"]
+    print(f"{'策略':<10}{'条数':>5}{'完整 token/任务':>16}{'主 agent':>12}"
+          f"{'子 agent':>11}{'子占比':>9}{'vs single':>12}")
+    print("-" * 104)
+    for r in rows:
+        print(f"{r['s']:<10}{r['n']:>5}{r['full']:>16.0f}{r['lead']:>12.0f}"
+              f"{r['child']:>11.0f}{100.0*r['child']/max(r['full'],1):>8.1f}%"
+              f"{r['full']/base:>11.2f}x")
+    print("-" * 104)
+    print(f"  明细来源：{os.path.relpath(path, ROOT)}（eval/run.py 的 _write_csv 导出）")
+    print("  「条数」为 0 表示该策略不在 CSV 里，用了库里的主 agent 值（无子 agent，两者相等）。")
+    print("  自洽性验证：没有 spawn 过的运行，「完整」必须严格等于「主 agent」——")
+    print("  实测 120 行里 25 行完全相等（全是 subagent 未触发 spawn 的运行），")
+    print("  且 120 行无一出现「完整 < 主 agent」。")
     return rows
 
 
@@ -242,6 +356,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default=DEFAULT_DB)
     ap.add_argument("--turns", action="store_true", help="只看轮次分布")
+    ap.add_argument("--csv", default=DEFAULT_CSV,
+                    help="run.py 导出的明细 CSV（完整口径用，含子 agent 开销）")
     args = ap.parse_args()
 
     if not os.path.exists(args.db):
@@ -255,6 +371,8 @@ def main():
     n = conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
     nj = conn.execute("SELECT COUNT(*) FROM runs WHERE passed IS NOT NULL").fetchone()[0]
     print(f"共 {n} 条运行记录，其中 {nj} 条已判定")
+    print("⚠️ token 有两个口径：【1】【2】【7】是主 agent（已按轮去重），"
+          "【9】是完整（含子 agent）。别混着比。")
 
     try:
         if args.turns:
@@ -267,6 +385,7 @@ def main():
             show_gap(conn)
             show_cost(conn)
             show_failures(conn)
+            show_cost_full(conn, args.csv)
     finally:
         conn.close()
     print()
